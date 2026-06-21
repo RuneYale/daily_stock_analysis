@@ -107,13 +107,13 @@ class TelegramSender:
         timeout_seconds: Optional[float] = None,
     ) -> bool:
         """Send a single Telegram message with exponential backoff retry (Fixes #287)"""
-        # Convert Markdown to Telegram-compatible format
-        telegram_text = self._convert_to_telegram_markdown(text)
+        # Convert Markdown to Telegram HTML (tables -> <pre>, headings -> <b>, etc.)
+        telegram_text = self._convert_to_telegram_html(text)
 
         payload = {
             "chat_id": chat_id,
             "text": telegram_text,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
 
@@ -301,25 +301,142 @@ class TelegramSender:
             logger.error("Telegram 图片发送异常: %s", e)
             return False
 
+    def _convert_to_telegram_html(self, text: str) -> str:
+        """
+        将标准 Markdown 转换为 Telegram HTML 格式。
+
+        Telegram HTML 支持的标签：<b> <i> <u> <s> <code> <pre> <a>
+        不支持 <h1-6>、<table>、<blockquote>、<ul> 等。
+
+        转换策略：
+        - Markdown 表格 -> <pre> 块（等宽字体，保留竖线对齐，整齐可读）
+        - # 标题 -> <b> 加粗 + 换行
+        - **bold** -> <b>bold</b>，*italic*/_italic_ -> <i>
+        - > 引用 -> › 前缀
+        - [text](url) -> <a href="url">text</a>
+        - 其余 HTML 特殊字符 < > & 转义
+        """
+        import html as _html
+
+        lines = text.split("\n")
+        out_lines: list = []
+        i = 0
+        n = len(lines)
+        # 表格 <pre> 块用占位符保护，避免后续 _html.escape 把 < > 转义破坏标签
+        pre_blocks: list = []
+
+        # 先把表格段抽出来单独处理（连续的 | ... | 行 + 紧跟的分隔行 |---|---|）
+        while i < n:
+            line = lines[i]
+            # 检测表格起始：行内含 | 且下一行是分隔行 |---|---|
+            if "|" in line and i + 1 < n and re.match(r"^\s*\|?[\s:|-]+\|?\s*$", lines[i + 1]) and "-" in lines[i + 1]:
+                # 收集整个表格块
+                table_block = [line, lines[i + 1]]
+                j = i + 2
+                while j < n and "|" in lines[j] and lines[j].strip():
+                    table_block.append(lines[j])
+                    j += 1
+                # 渲染成 <pre> 对齐文本，用占位符保护（内部已转义）
+                pre_html = self._render_table_as_pre(table_block)
+                pre_blocks.append(pre_html)
+                out_lines.append(f"\x00PRE{len(pre_blocks) - 1}\x00")
+                i = j
+                continue
+            out_lines.append(line)
+            i += 1
+
+        result = "\n".join(out_lines)
+
+        # 1) 先保护 Markdown 链接 [text](url)，避免被后续转义破坏
+        links: list = []
+
+        def _save_link(m):
+            links.append((m.group(1), m.group(2)))
+            return f"\x00LINK{len(links) - 1}\x00"
+
+        result = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _save_link, result)
+
+        # 2) 转义 HTML 特殊字符
+        result = _html.escape(result, quote=False)
+
+        # 3) 行内格式：**bold** -> <b>，*italic* / _italic_ -> <i>，`code` -> <code>
+        #    注意转义后 ** 仍是 **，* 仍是 *，` 仍是 `
+        result = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", result)
+        result = re.sub(r"(?<!\w)[*_]([^*_\n]+?)[*_](?!\w)", r"<i>\1</i>", result)
+        result = re.sub(r"`([^`\n]+?)`", r"<code>\1</code>", result)
+
+        # 4) 还原表格 <pre> 块（占位符 -> 已转义的 pre HTML）
+        result = re.sub(r"\x00PRE(\d+)\x00", lambda m: pre_blocks[int(m.group(1))], result)
+
+        # 4) 标题 # -> <b> 加粗（行首 1-6 个 #）
+        result = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", result, flags=re.MULTILINE)
+
+        # 5) 引用 > -> › 前缀（< 已转义为 &gt;，这里匹配转义后的）
+        result = re.sub(r"^&gt;\s?", "› ", result, flags=re.MULTILINE)
+
+        # 6) 还原链接为 <a href>
+        def _restore_link(m):
+            idx = int(m.group(1))
+            text_, url = links[idx]
+            return f'<a href="{_html.escape(url, quote=True)}">{text_}</a>'
+
+        result = re.sub(r"\x00LINK(\d+)\x00", _restore_link, result)
+
+        return result
+
+    def _render_table_as_pre(self, table_lines: list) -> str:
+        """把 Markdown 表格行渲染成 <pre> 对齐文本块。"""
+        # 解析每行为单元格（去掉首尾 |）
+        rows = []
+        for ln in table_lines:
+            ln = ln.strip()
+            if not ln.startswith("|"):
+                ln = "|" + ln
+            if not ln.endswith("|"):
+                ln = ln + "|"
+            cells = [c.strip() for c in ln.strip("|").split("|")]
+            rows.append(cells)
+
+        if len(rows) < 2:
+            return "\n".join(table_lines)
+
+        # 第二行是分隔行 |---|---|，丢弃（不显示）
+        header = rows[0]
+        body = rows[2:] if len(rows) > 2 else []
+
+        # 计算每列最大宽度（按显示宽度，CJK 字符算 2）
+        def _disp_width(s: str) -> int:
+            w = 0
+            for ch in s:
+                w += 2 if ord(ch) > 0x2E80 else 1
+            return w
+
+        def _pad(s: str, width: int) -> str:
+            return s + " " * (width - _disp_width(s))
+
+        num_cols = max(len(r) for r in [header] + body)
+        widths = [0] * num_cols
+        for r in [header] + body:
+            for ci, cell in enumerate(r):
+                widths[ci] = max(widths[ci], _disp_width(cell))
+
+        def _fmt_row(r):
+            return "| " + " | ".join(_pad(r[ci], widths[ci]) if ci < len(r) else " " * widths[ci] for ci in range(num_cols)) + " |"
+
+        rendered = [_fmt_row(header), "|" + "|".join("-" * (widths[ci] + 2) for ci in range(num_cols)) + "|"]
+        for r in body:
+            rendered.append(_fmt_row(r))
+
+        # <pre> 里不需要 HTML 标签，但要转义 < > &（表格内容里可能有）
+        import html as _html
+        inner = "\n".join(rendered)
+        return f"<pre>{_html.escape(inner, quote=False)}</pre>"
+
     def _convert_to_telegram_markdown(self, text: str) -> str:
-        """
-        将标准 Markdown 转换为 Telegram 支持的格式
-
-        Telegram Markdown 限制：
-        - 不支持 # 标题
-        - 使用 *bold* 而非 **bold**
-        - 使用 _italic_
-        """
+        """已弃用：旧版 Telegram Markdown 转换。保留以兼容外部调用，内部改用 HTML。"""
         result = text
-
-        # 移除 # 标题标记（Telegram 不支持）
         result = re.sub(r'^#{1,6}\s+', '', result, flags=re.MULTILINE)
-
-        # 转换 **bold** 为 *bold*
         result = re.sub(r'\*\*(.+?)\*\*', r'*\1*', result)
-
-        # Escape special characters for Telegram Markdown, but preserve link syntax [text](url)
-        # Step 1: temporarily protect markdown links
         import uuid as _uuid
         _link_placeholder = f"__LINK_{_uuid.uuid4().hex[:8]}__"
         _links = []
@@ -327,13 +444,8 @@ class TelegramSender:
             _links.append(m.group(0))
             return f"{_link_placeholder}{len(_links) - 1}"
         result = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', _save_link, result)
-
-        # Step 2: escape remaining special chars
         for char in ['[', ']', '(', ')']:
             result = result.replace(char, f'\\{char}')
-
-        # Step 3: restore links
         for i, link in enumerate(_links):
             result = result.replace(f"{_link_placeholder}{i}", link)
-
         return result

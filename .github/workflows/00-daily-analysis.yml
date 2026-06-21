@@ -47,22 +47,10 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 设置 Node.js 环境（用于 m2f 转 PNG 图片）
-        uses: actions/setup-node@v5
-        with:
-          node-version: '20'
-
       - name: 安装依赖
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          # 安装 markdown-to-file（m2f），用于把报告 Markdown 转成 PNG 图片推送
-          # 依赖 puppeteer-core，复用 GitHub Actions 预装的 Chrome（/usr/bin/google-chrome）
-          npm install -g markdown-to-file
-          m2f --version || true
-          # 安装中文字体，否则转出的 PNG 中文显示为方框（CSS 字体栈含 Noto Sans CJK SC）
-          sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra 2>/dev/null || true
-          fc-list :lang=zh | head -3 || true
 
       - name: 创建必要目录
         run: |
@@ -389,9 +377,11 @@ jobs:
           REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
 
           # ==========================================
-          # Markdown 转图片（Issue #455）—— 报告转 PNG 推送，避免 Telegram 不支持表格
+          # Markdown 转图片（Issue #455）—— 已禁用
+          # Telegram 改用 HTML 格式发送（表格转 <pre> 对齐），清晰且不模糊，
+          # 无需装 m2f/Chrome/中文字体。如需图片模式，设 MARKDOWN_TO_IMAGE_CHANNELS=telegram
           # ==========================================
-          MARKDOWN_TO_IMAGE_CHANNELS: ${{ vars.MARKDOWN_TO_IMAGE_CHANNELS || 'telegram' }}
+          MARKDOWN_TO_IMAGE_CHANNELS: ${{ vars.MARKDOWN_TO_IMAGE_CHANNELS || '' }}
           MD2IMG_ENGINE: ${{ vars.MD2IMG_ENGINE || 'markdown-to-file' }}
           MARKDOWN_TO_IMAGE_MAX_CHARS: ${{ vars.MARKDOWN_TO_IMAGE_MAX_CHARS || '15000' }}
           
