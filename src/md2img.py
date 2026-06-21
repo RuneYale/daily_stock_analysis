@@ -91,6 +91,14 @@ def _markdown_to_image_m2f(markdown_text: str) -> Optional[bytes]:
                 "请安装 Chrome 或设置 executablePath。"
             )
 
+        # 中文字体样式表：默认字体栈无中文字形，中文会显示成方框
+        # 用跨平台字体栈(微软雅黑/苹方/Noto/文泉驿)覆盖 html/body/标题/表格
+        font_css = os.path.join(os.path.dirname(__file__), "md2img_font.css")
+        if os.path.isfile(font_css):
+            cmd.append(f"styles={font_css}")
+        else:
+            logger.warning("m2f: 未找到中文字体样式表 %s，中文可能显示为方框", font_css)
+
         result = subprocess.run(
             cmd,
             capture_output=True,

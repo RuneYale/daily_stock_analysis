@@ -60,6 +60,9 @@ jobs:
           # 依赖 puppeteer-core，复用 GitHub Actions 预装的 Chrome（/usr/bin/google-chrome）
           npm install -g markdown-to-file
           m2f --version || true
+          # 安装中文字体，否则转出的 PNG 中文显示为方框（CSS 字体栈含 Noto Sans CJK SC）
+          sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-cjk-extra 2>/dev/null || true
+          fc-list :lang=zh | head -3 || true
 
       - name: 创建必要目录
         run: |

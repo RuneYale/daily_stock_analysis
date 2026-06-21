@@ -1,0 +1,38 @@
+/* m2f 转 PNG 时的中文字体样式表
+ * 解决默认字体栈无中文字形导致中文显示为方框的问题。
+ * 跨平台字体栈：Windows 微软雅黑 / Mac 苹方 / Linux Noto或文泉驿
+ */
+html, body {
+    font-family: "Microsoft YaHei", "微软雅黑", "PingFang SC", "Hiragino Sans GB",
+                 "Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei",
+                 "Heiti SC", "SimHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.7;
+    color: #222;
+}
+
+/* 标题加粗加深 */
+h1, h2, h3, h4, h5, h6 {
+    font-family: "Microsoft YaHei", "微软雅黑", "PingFang SC", "Noto Sans CJK SC",
+                 "Source Han Sans SC", "WenQuanYi Micro Hei", "Heiti SC", sans-serif;
+    font-weight: bold;
+    color: #1a1a1a;
+}
+
+/* 代码/等宽内容用跨平台等宽字体 */
+code, pre {
+    font-family: "Cascadia Code", "Consolas", "Courier New", "Noto Sans Mono CJK SC",
+                 monospace;
+}
+
+/* 表格边框，提升可读性 */
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+th, td {
+    border: 1px solid #ccc;
+    padding: 6px 10px;
+    font-family: "Microsoft YaHei", "微软雅黑", "PingFang SC", "Noto Sans CJK SC",
+                 "Source Han Sans SC", "WenQuanYi Micro Hei", sans-serif;
+}
