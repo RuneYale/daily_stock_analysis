@@ -25,9 +25,46 @@ from src.formatters import markdown_to_html_document
 logger = logging.getLogger(__name__)
 
 
+# 常见 Chrome/Chromium/Edge 可执行文件路径（跨平台，puppeteer-core 不自带 Chromium）
+_CHROME_CANDIDATES = [
+    # Windows
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    # macOS
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    # Linux（GitHub Actions ubuntu 已预装 Chrome，见 actions/setup-python 镜像）
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/microsoft-edge",
+]
+
+
+def _detect_chrome_executable() -> Optional[str]:
+    """返回首个存在的 Chrome/Edge 可执行文件路径，找不到则 None。
+
+    m2f 依赖 puppeteer-core，它不会自动下载 Chromium，必须显式指定一个浏览器。
+    GitHub Actions ubuntu-latest 预装了 google-chrome；本地通常装了 Chrome 或 Edge。
+    """
+    for path in _CHROME_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    # 退回到 PATH 查找（Linux 常见）
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "msedge"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
 def _markdown_to_image_m2f(markdown_text: str) -> Optional[bytes]:
     """Convert Markdown to PNG via markdown-to-file (m2f) CLI. Better emoji support (Issue #455)."""
-    if shutil.which("m2f") is None:
+    m2f_bin = shutil.which("m2f")
+    if m2f_bin is None:
         logger.warning(
             "m2f (markdown-to-file) not found in PATH. "
             "Install with: npm i -g markdown-to-file. Fallback to text."
@@ -41,8 +78,21 @@ def _markdown_to_image_m2f(markdown_text: str) -> Optional[bytes]:
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(markdown_text)
 
+        # m2f 依赖 puppeteer-core，需显式指定浏览器可执行文件
+        # m2f_bin 来自 shutil.which，Windows 下解析为 m2f.cmd 完整路径，
+        # subprocess 带扩展名即可直接执行（无需 shell=True，避免空格路径转义坑）
+        cmd = [m2f_bin, md_path, "png", f"outputDirectory={temp_dir}"]
+        chrome_path = _detect_chrome_executable()
+        if chrome_path:
+            cmd.append(f"executablePath={chrome_path}")
+        else:
+            logger.warning(
+                "m2f: 未检测到 Chrome/Chromium/Edge，puppeteer 可能无法启动。"
+                "请安装 Chrome 或设置 executablePath。"
+            )
+
         result = subprocess.run(
-            ["m2f", md_path, "png", f"outputDirectory={temp_dir}"],
+            cmd,
             capture_output=True,
             timeout=60,
             check=False,

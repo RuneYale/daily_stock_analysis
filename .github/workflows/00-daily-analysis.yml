@@ -46,12 +46,21 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-      
+
+      - name: 设置 Node.js 环境（用于 m2f 转 PNG 图片）
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+
       - name: 安装依赖
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-      
+          # 安装 markdown-to-file（m2f），用于把报告 Markdown 转成 PNG 图片推送
+          # 依赖 puppeteer-core，复用 GitHub Actions 预装的 Chrome（/usr/bin/google-chrome）
+          npm install -g markdown-to-file
+          m2f --version || true
+
       - name: 创建必要目录
         run: |
           mkdir -p data logs reports
@@ -375,6 +384,13 @@ jobs:
           # 可选值: tencent, akshare_sina, efinance, akshare_em, tushare
           # 如果有 Tushare Pro 高积分账号，可将 tushare 放在首位
           REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
+
+          # ==========================================
+          # Markdown 转图片（Issue #455）—— 报告转 PNG 推送，避免 Telegram 不支持表格
+          # ==========================================
+          MARKDOWN_TO_IMAGE_CHANNELS: ${{ vars.MARKDOWN_TO_IMAGE_CHANNELS || 'telegram' }}
+          MD2IMG_ENGINE: ${{ vars.MD2IMG_ENGINE || 'markdown-to-file' }}
+          MARKDOWN_TO_IMAGE_MAX_CHARS: ${{ vars.MARKDOWN_TO_IMAGE_MAX_CHARS || '15000' }}
           
         run: |
           # 处理 LITELLM YAML 配置文件
