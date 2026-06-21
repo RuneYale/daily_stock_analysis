@@ -472,13 +472,13 @@ jobs:
             echo "⚡ 已启用强制运行模式（跳过交易日检查）"
           fi
 
-          # 执行分析
+          # 执行分析（--single-notify：每只股票单独推送一条消息，避免汇总报告超 4096 字符）
           if [ "$MODE" = "market-only" ]; then
             python main.py --market-review $FORCE_RUN_ARG
           elif [ "$MODE" = "stocks-only" ]; then
-            python main.py --no-market-review $FORCE_RUN_ARG
+            python main.py --no-market-review --single-notify $FORCE_RUN_ARG
           else
-            python main.py $FORCE_RUN_ARG
+            python main.py --single-notify $FORCE_RUN_ARG
           fi
       
       - name: 上传分析报告
