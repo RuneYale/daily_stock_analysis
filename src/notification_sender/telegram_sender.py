@@ -106,15 +106,21 @@ class TelegramSender:
         *,
         timeout_seconds: Optional[float] = None,
     ) -> bool:
-        """Send a single Telegram message with exponential backoff retry (Fixes #287)"""
-        # Telegram MarkdownV2 格式（按官方规范）：标题 *bold*、表格 ```代码块```
-        # 严格按 core.telegram.org/bots/api#markdownv2-style 转义规则
-        telegram_text = self._convert_to_telegram_markdownv2(text)
+        """Send a single Telegram message with exponential backoff retry (Fixes #287)
+
+        优先用 sendRichMessage（真表格 <table>），失败回退到 sendMessage HTML（<pre> 模拟表格）。
+        """
+        # 1) 优先尝试 sendRichMessage：表格用真 <table>，其余用 Rich Markdown（支持 # 标题、**bold**）
+        if self._send_telegram_rich(api_url, chat_id, text, message_thread_id, timeout_seconds=timeout_seconds):
+            return True
+
+        # 2) 回退：sendMessage + HTML（表格转 <pre>，标题 <b>）
+        telegram_text = self._convert_to_telegram_html(text)
 
         payload = {
             "chat_id": chat_id,
             "text": telegram_text,
-            "parse_mode": "MarkdownV2",
+            "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
 
@@ -177,6 +183,123 @@ class TelegramSender:
                 return False
 
         return False
+
+    def _send_telegram_rich(
+        self,
+        api_url: str,
+        chat_id: str,
+        text: str,
+        message_thread_id: Optional[str] = None,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
+        """用 sendRichMessage 发送，表格渲染为真 <table>，其余用 Rich Markdown。
+
+        Rich Markdown 支持 # 标题、**bold**、*italic*、> 引用、- 列表、[text](url)、
+        以及嵌入 HTML <table bordered striped> 真表格。
+        失败时返回 False，由调用方回退到 sendMessage HTML。
+        """
+        # 从 sendMessage URL 构造 sendRichMessage URL
+        # api_url 形如 https://api.telegram.org/bot<token>/sendMessage
+        if "/sendMessage" not in api_url:
+            return False
+        rich_url = api_url.replace("/sendMessage", "/sendRichMessage")
+
+        # 转换：去 emoji + Markdown 表格转 <table>（其余 Rich Markdown 语法原样保留）
+        rich_markdown = self._convert_to_rich_markdown(text)
+        if not rich_markdown.strip():
+            return False
+
+        payload = {
+            "chat_id": chat_id,
+            "rich_message": {"markdown": rich_markdown},
+        }
+        if message_thread_id:
+            payload["message_thread_id"] = message_thread_id
+
+        try:
+            response = requests.post(rich_url, json=payload, timeout=timeout_seconds or 15)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            logger.warning(f"sendRichMessage 请求失败，将回退 HTML: {e}")
+            return False
+
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("ok"):
+                logger.info("Telegram 消息发送成功（Rich 真表格）")
+                return True
+            logger.warning(f"sendRichMessage 返回错误，将回退 HTML: {result.get('description', '')}")
+            return False
+        logger.warning(f"sendRichMessage HTTP {response.status_code}，将回退 HTML: {response.text[:150]}")
+        return False
+
+    def _convert_to_rich_markdown(self, text: str) -> str:
+        """将报告 Markdown 转成 Rich Markdown：表格转 <table>，其余原样保留。
+
+        Rich Markdown 支持 # 标题、**bold**、> 引用、- 列表、[link](url)，
+        并可在 markdown 字段里直接嵌入 HTML <table> 真表格。
+        只需做：去 emoji + Markdown 表格转 <table bordered striped>。
+        """
+        # 1) 去掉 emoji
+        result = self._strip_emoji(text)
+
+        # 2) Markdown 表格 |...| -> <table bordered striped><tr><th>...</th></tr>...</table>
+        lines = result.split("\n")
+        out_lines: list = []
+        i = 0
+        n = len(lines)
+        while i < n:
+            line = lines[i]
+            # 检测表格起始：行内含 | 且下一行是分隔行 |---|---|
+            if "|" in line and i + 1 < n and re.match(r"^\s*\|?[\s:|-]+\|?\s*$", lines[i + 1]) and "-" in lines[i + 1]:
+                table_block = [line, lines[i + 1]]
+                j = i + 2
+                while j < n and "|" in lines[j] and lines[j].strip():
+                    table_block.append(lines[j])
+                    j += 1
+                # 渲染成 <table> HTML
+                out_lines.append(self._render_table_as_html(table_block))
+                i = j
+                continue
+            out_lines.append(line)
+            i += 1
+
+        return "\n".join(out_lines)
+
+    def _render_table_as_html(self, table_lines: list) -> str:
+        """把 Markdown 表格行渲染成 Rich HTML <table bordered striped>。"""
+        # 解析每行单元格
+        rows = []
+        for ln in table_lines:
+            ln = ln.strip()
+            if not ln.startswith("|"):
+                ln = "|" + ln
+            if not ln.endswith("|"):
+                ln = ln + "|"
+            cells = [c.strip() for c in ln.strip("|").split("|")]
+            rows.append(cells)
+
+        if len(rows) < 2:
+            return "\n".join(table_lines)
+
+        header = rows[0]
+        body = rows[2:] if len(rows) > 2 else []  # 跳过分隔行 rows[1]
+
+        def _cell_to_html(cell: str, is_header: bool) -> str:
+            # 清理 cell 内的 **/__ 标记（表格 cell 只支持行内格式，** 在 HTML 表格里不渲染）
+            cell = re.sub(r"\*\*(.+?)\*\*", r"\1", cell)
+            cell = re.sub(r"__(.+?)__", r"\1", cell)
+            tag = "th" if is_header else "td"
+            return f"<{tag}>{cell}</{tag}>"
+
+        html_parts = ['<table bordered striped>']
+        # 表头
+        html_parts.append("<tr>" + "".join(_cell_to_html(c, True) for c in header) + "</tr>")
+        # 表体
+        for r in body:
+            html_parts.append("<tr>" + "".join(_cell_to_html(c, False) for c in r) + "</tr>")
+        html_parts.append("</table>")
+        return "".join(html_parts)
 
     @staticmethod
     def _should_fallback_to_plain_text(error_desc: str = "", response_text: str = "") -> bool:
@@ -355,6 +478,9 @@ class TelegramSender:
         - 其余 HTML 特殊字符 < > & 转义
         """
         import html as _html
+
+        # 先去掉所有 emoji（用户要求，精确匹配 emoji 区段避免误伤中文）
+        text = self._strip_emoji(text)
 
         lines = text.split("\n")
         out_lines: list = []
