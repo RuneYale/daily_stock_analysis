@@ -107,13 +107,14 @@ class TelegramSender:
         timeout_seconds: Optional[float] = None,
     ) -> bool:
         """Send a single Telegram message with exponential backoff retry (Fixes #287)"""
-        # Convert Markdown to Telegram HTML (tables -> <pre>, headings -> <b>, etc.)
-        telegram_text = self._convert_to_telegram_html(text)
+        # Telegram MarkdownV2 格式（按官方规范）：标题 *bold*、表格 ```代码块```
+        # 严格按 core.telegram.org/bots/api#markdownv2-style 转义规则
+        telegram_text = self._convert_to_telegram_markdownv2(text)
 
         payload = {
             "chat_id": chat_id,
             "text": telegram_text,
-            "parse_mode": "HTML",
+            "parse_mode": "MarkdownV2",
             "disable_web_page_preview": True
         }
 
@@ -301,6 +302,43 @@ class TelegramSender:
             logger.error("Telegram 图片发送异常: %s", e)
             return False
 
+    def _convert_to_telegram_plain(self, text: str) -> str:
+        """
+        将 Markdown 转成纯文本（不使用 parse_mode）。
+
+        参考 Morning Brief 风格：Telegram 原样显示，零转义乱码。
+        - 去掉 # 标题标记（保留标题文字 + emoji 做层次）
+        - 去掉 ** 和 __ 行内标记
+        - 去掉 > 引用标记（保留内容）
+        - 表格保留 | 竖线（纯文本竖线在 Telegram 显示整齐）
+        - 保留 emoji、【】、分隔线 ---
+        """
+        result = text
+
+        # 去掉行首 # 标题标记（1-6 个 #），保留标题文字
+        result = re.sub(r'^#{1,6}\s+', '', result, flags=re.MULTILINE)
+
+        # 去掉行内粗体/斜体标记：**bold** -> bold, __bold__ -> bold, *italic* -> italic
+        result = re.sub(r'\*\*(.+?)\*\*', r'\1', result)
+        result = re.sub(r'__(.+?)__', r'\1', result)
+        # 单星号斜体 *italic* -> italic（谨慎：避免误删列表 *，只处理成对的）
+        result = re.sub(r'(?<!\w)\*([^*\n]+)\*(?!\w)', r'\1', result)
+
+        # 去掉行内 code 标记 `code` -> code
+        result = re.sub(r'`([^`\n]+)`', r'\1', result)
+
+        # 去掉 ``` 代码块围栏（保留内容）
+        result = re.sub(r'^```\w*\s*$', '', result, flags=re.MULTILINE)
+        result = re.sub(r'^```$', '', result, flags=re.MULTILINE)
+
+        # 去掉行首 > 引用标记（保留内容）
+        result = re.sub(r'^>\s?', '', result, flags=re.MULTILINE)
+
+        # 链接 [text](url) -> text（纯文本不支持链接，保留显示文字）
+        result = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1', result)
+
+        return result
+
     def _convert_to_telegram_html(self, text: str) -> str:
         """
         将标准 Markdown 转换为 Telegram HTML 格式。
@@ -431,6 +469,219 @@ class TelegramSender:
         import html as _html
         inner = "\n".join(rendered)
         return f"<pre>{_html.escape(inner, quote=False)}</pre>"
+
+    def _render_table_as_mdcode(self, table_lines: list) -> str:
+        """把 Markdown 表格行渲染成 MarkdownV2 代码块(```...```)，保留竖线对齐。
+
+        代码块内部按官方规则只需转义 ` 和 \\，其它字符原样。
+        清理 cell 内的 **/__/` 标记（代码块内不渲染格式，留着会显示成字面字符）。
+        """
+        rows = []
+        for ln in table_lines:
+            ln = ln.strip()
+            if not ln.startswith("|"):
+                ln = "|" + ln
+            if not ln.endswith("|"):
+                ln = ln + "|"
+            cells = [c.strip() for c in ln.strip("|").split("|")]
+            rows.append(cells)
+
+        if len(rows) < 2:
+            return "\n".join(table_lines)
+
+        header = rows[0]
+        body = rows[2:] if len(rows) > 2 else []
+
+        def _disp_width(s: str) -> int:
+            return sum(2 if ord(ch) > 0x2E80 else 1 for ch in s)
+
+        def _pad(s: str, width: int) -> str:
+            return s + " " * (width - _disp_width(s))
+
+        def _clean_cell(s: str) -> str:
+            # 去掉行内格式标记（代码块内不渲染），再转义 ` 和 \
+            s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+            s = re.sub(r"__(.+?)__", r"\1", s)
+            s = s.replace("`", "").replace("\\", "\\\\")
+            return s
+
+        num_cols = max(len(r) for r in [header] + body)
+        widths = [0] * num_cols
+        for r in [header] + body:
+            for ci, cell in enumerate(r):
+                widths[ci] = max(widths[ci], _disp_width(_clean_cell(cell)))
+
+        def _fmt_row(r):
+            return "| " + " | ".join(_pad(_clean_cell(r[ci]), widths[ci]) if ci < len(r) else " " * widths[ci] for ci in range(num_cols)) + " |"
+
+        rendered = [_fmt_row(header), "|" + "|".join("-" * (widths[ci] + 2) for ci in range(num_cols)) + "|"]
+        for r in body:
+            rendered.append(_fmt_row(r))
+
+        inner = "\n".join(rendered)
+        return f"```\n{inner}\n```"
+
+    def _convert_to_telegram_markdownv2(self, text: str) -> str:
+        """
+        将标准 Markdown 转换为 Telegram MarkdownV2 格式（严格按官方规范）。
+
+        官方规范（core.telegram.org/bots/api#markdownv2-style）：
+        - 语法：*bold* _italic_ `code` ```codeblock``` [text](url) > 引用
+        - 实体外的这些字符必须转义(前加 \\)：_ * [ ] ( ) ~ ` > # + - = | { } . !
+        - pre/code 实体内部：只需转义 ` 和 \\，其它字符原样
+        - 链接 (...) 内部：只需转义 ) 和 \\
+
+        转换策略：
+        - 去掉所有 emoji（用户要求）
+        - Markdown 表格 -> ``` 代码块（内部原样，仅转义 ` 和 \\）
+        - # 标题 -> *bold* 加粗
+        - **bold** -> *bold*
+        - [text](url) 链接保留
+        - 实体外特殊字符转义
+        """
+        # 0) 去掉所有 emoji（覆盖常见 emoji 区段）
+        result = self._strip_emoji(text)
+
+        lines = result.split("\n")
+        out_lines: list = []
+        i = 0
+        n = len(lines)
+        code_blocks: list = []
+
+        # 1) 抽表格 -> ``` 代码块占位符（代码块内部按官方规则只转义 ` 和 \）
+        while i < n:
+            line = lines[i]
+            if "|" in line and i + 1 < n and re.match(r"^\s*\|?[\s:|-]+\|?\s*$", lines[i + 1]) and "-" in lines[i + 1]:
+                table_block = [line, lines[i + 1]]
+                j = i + 2
+                while j < n and "|" in lines[j] and lines[j].strip():
+                    table_block.append(lines[j])
+                    j += 1
+                code_html = self._render_table_as_mdcode(table_block)
+                code_blocks.append(code_html)
+                out_lines.append(f"\x00CODE{len(code_blocks) - 1}\x00")
+                i = j
+                continue
+            out_lines.append(line)
+            i += 1
+
+        result = "\n".join(out_lines)
+
+        # 2) 保护已存在的 ``` 代码块（报告里可能有，按 pre 规则处理）
+        existing_codes: list = []
+
+        def _save_existing_code(m):
+            # 代码块内部只转义 ` 和 \，其它原样
+            inner = m.group(1)
+            inner = inner.replace("\\", "\\\\").replace("`", "\\`")
+            existing_codes.append(f"```\n{inner}\n```")
+            return f"\x00EXIST{len(existing_codes) - 1}\x00"
+
+        result = re.sub(r"```(?:\w*)\n?(.*?)```", _save_existing_code, result, flags=re.DOTALL)
+
+        # 3) 保护行内 `code`（code 实体内部只转义 ` 和 \）
+        inline_codes: list = []
+
+        def _save_inline(m):
+            inner = m.group(1)
+            inner = inner.replace("\\", "\\\\").replace("`", "\\`")
+            inline_codes.append(f"`{inner}`")
+            return f"\x00INLINE{len(inline_codes) - 1}\x00"
+
+        result = re.sub(r"`([^`\n]+)`", _save_inline, result)
+
+        # 4) 保护 Markdown 链接 [text](url)
+        links: list = []
+
+        def _save_link(m):
+            links.append((m.group(1), m.group(2)))
+            return f"\x00LINK{len(links) - 1}\x00"
+
+        result = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _save_link, result)
+
+        # 5) 转换 **bold** -> *bold*（MarkdownV2 粗体是单星号）
+        result = re.sub(r"\*\*(.+?)\*\*", r"*\1*", result)
+
+        # 5.5) # 标题 -> *bold* 加粗（MarkdownV2 不支持 #）
+        result = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", result, flags=re.MULTILINE)
+
+        # 6) 保护 *bold* 和 _italic_ 边界（内部内容仍需转义，官方:实体内特殊字符也要转义）
+        _BSTAR = "\x00B\x00"
+        _ESTAR = "\x00E\x00"
+        _BUND = "\x00U\x00"
+        _EUND = "\x00V\x00"
+
+        def _mask_bold(m):
+            return _BSTAR + m.group(1) + _ESTAR
+        result = re.sub(r"\*([^*\n]+)\*", _mask_bold, result)
+
+        def _mask_italic(m):
+            return _BUND + m.group(1) + _EUND
+        result = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", _mask_italic, result)
+
+        # 7) 转义实体外的特殊字符（官方完整列表：_ * [ ] ( ) ~ ` > # + - = | { } . ! \）
+        def _escape_mdv2(s: str) -> str:
+            out = []
+            for ch in s:
+                if ch in '_*[]()~`>#+-=|{}.!\\':
+                    out.append("\\")
+                    out.append(ch)
+                else:
+                    out.append(ch)
+            return "".join(out)
+
+        result = _escape_mdv2(result)
+
+        # 8) 还原格式标记边界
+        result = result.replace(_BSTAR, "*").replace(_ESTAR, "*")
+        result = result.replace(_BUND, "_").replace(_EUND, "_")
+
+        # 9) 还原行内 code、代码块、表格代码块（这些已经在保护时处理过内部转义）
+        for i_, c in enumerate(inline_codes):
+            result = result.replace(f"\x00INLINE{i_}\x00", c)
+        for i_, c in enumerate(existing_codes):
+            result = result.replace(f"\x00EXIST{i_}\x00", c)
+        for i_, cb in enumerate(code_blocks):
+            result = result.replace(f"\x00CODE{i_}\x00", cb)
+
+        # 10) 还原链接（text 部分已被转义流程处理，url 内部只需转义 ) 和 \）
+        def _restore_link(m):
+            idx = int(m.group(1))
+            t, url = links[idx]
+            url = url.replace("\\", "\\\\").replace(")", "\\)")
+            return f"[{t}]({url})"
+
+        result = re.sub(r"\x00LINK(\d+)\x00", _restore_link, result)
+
+        return result
+
+    @staticmethod
+    def _strip_emoji(text: str) -> str:
+        """去掉所有 emoji（只匹配真正的 emoji 区段，避免误伤中文）。"""
+        emoji_pattern = re.compile(
+            "["
+            "\U0001F600-\U0001F64F"  # 表情符号 😀-🙏
+            "\U0001F300-\U0001F5FF"  # 符号和象形文字 🌀-🗿
+            "\U0001F680-\U0001F6FF"  # 交通和地图符号 🚀-🛿
+            "\U0001F700-\U0001F77F"  # 代数符号
+            "\U0001F780-\U0001F7FF"  # 几何图形扩展
+            "\U0001F800-\U0001F8FF"  # 补充箭头-C
+            "\U0001F900-\U0001F9FF"  # 补充符号和象形文字 🤀-🧿
+            "\U0001FA00-\U0001FA6F"  # 扩展符号A
+            "\U0001FA70-\U0001FAFF"  # 扩展符号B
+            "\U0001F1E0-\U0001F1FF"  # 旗帜 🇦-🇿
+            "\u2600-\u26FF"          # 杂项符号（☀ ☂ ☎ 等，不含中文）
+            "\u2700-\u27BF"          # 装饰符号 ✁-➿
+            "\uFE0F"                 # 变体选择符-16（emoji 显示修饰）
+            "\u200D"                 # 零宽连字（emoji 组合用）
+            "]+",
+            flags=re.UNICODE,
+        )
+        result = emoji_pattern.sub("", text)
+        # 去掉删除 emoji 后留下的行首多余空格和多余空行
+        result = re.sub(r"^[ \t]+", "", result, flags=re.MULTILINE)
+        result = re.sub(r"\n{3,}", "\n\n", result)
+        return result
 
     def _convert_to_telegram_markdown(self, text: str) -> str:
         """已弃用：旧版 Telegram Markdown 转换。保留以兼容外部调用，内部改用 HTML。"""
